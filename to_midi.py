@@ -1,9 +1,6 @@
 import os
-import pdb
 import mido
 import argparse
-import warnings
-import itertools
 
 from util import Int4 
 from collections import deque
