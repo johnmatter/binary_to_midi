@@ -4,6 +4,7 @@ import argparse
 
 from util import Int4 
 from collections import deque
+from midi_encoder import MidiEncoder
 
 PPQN = 480
 TEMPO = 120
@@ -15,32 +16,54 @@ def main(args: argparse.Namespace) -> None:
     Args:
         args (argparse.Namespace): Command line arguments.
     """
-    file_path = args.file_path
-    output_path = args.output_file
-    chunk_size = args.chunk_size 
-    max_chunks = args.max_chunks
-
-    if not os.path.isfile(file_path):
-        print(f"File {file_path} does not exist.")
+    try:
+        encoder = MidiEncoder(args.pattern)
+    except PatternError as e:
+        print(f"Error with pattern '{args.pattern}': {e}")
         return
-
-    data = read_file_as_bytes(file_path)
-    max_chunks = len(data) // chunk_size if max_chunks == -1 else max_chunks
-    chunks = chunk_data(data, chunk_size, max_chunks)
-
+        
+    try:
+        data = read_file_as_bytes(args.file_path)
+    except FileNotFoundError:
+        print(f"Error: File '{args.file_path}' not found")
+        return
+    except IOError as e:
+        print(f"Error reading file: {e}")
+        return
+        
     messages = []
-    active_notes = set()
-    while len(chunks) > 0:
-        # one nibble for channel, two each for note and velocity, two nibbles for note on time, one nibble for note length
-        chunk_group = deque([chunks.popleft() for _ in range(8)])
-        note_on_message, note_off_message = create_midi_message(chunk_group)
-
-        messages.append(note_on_message)
-        messages.append(note_off_message)
-        print_human_readable_midi(note_on_message)
-        print_human_readable_midi(note_off_message)
-
-    create_midi_file(messages, output_path)
+    try:
+        chunks = chunk_data(data, args.chunk_size, args.max_chunks)
+        print(f"Created {len(chunks)} nibbles from input file")
+        
+        while chunks:
+            try:
+                print(f"\nProcessing chunk with {len(chunks)} nibbles remaining...")
+                message_pairs, remainder = encoder.encode_chunk(chunks)
+                
+                for note_on, note_off in message_pairs:
+                    messages.extend([note_on, note_off])
+                    if args.output == 'print':
+                        print_human_readable_midi(note_on)
+                        print_human_readable_midi(note_off)
+                        
+                if remainder:
+                    print(f"Remainder found: {remainder}")
+                    break
+                    
+            except NibbleProcessingError as e:
+                print(f"Error processing nibbles: {e}")
+                break
+                
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        return
+        
+    if args.output == 'file' and messages:
+        try:
+            create_midi_file(messages, args.output_file)
+        except IOError as e:
+            print(f"Error saving MIDI file: {e}")
 
 def read_file_as_bytes(file_path: str) -> bytes:
     """
@@ -114,127 +137,6 @@ def chunk_data(data: bytes, chunk_size: int, num_chunks: int) -> deque:
 
     return nibbles
 
-def create_midi_message(chunk_group: deque) -> mido.Message:
-    """
-    Creates a MIDI message from a group of nibbles.
-
-    Args:
-        chunk_group (deque): A deque of nibbles representing a MIDI message.
-
-    Returns:
-        mido.Message: A MIDI message object.
-
-    Note-On Message:
-    - Status Byte: 1001cccc (where cccc is the MIDI channel number, 0-15)
-    - Data Byte 1: 0nnnnnnn (where nnnnnnn is the note number, 0-127)
-    - Data Byte 2: 0vvvvvvv (where vvvvvvv is the velocity, 0-127)
-
-    Note-Off Message:
-    - Status Byte: 1000nnnn (where nnnn is the MIDI channel number, 0-15)
-    - Data Byte 1: 0kkkkkkk (where kkkkkkk is the note number, 0-127)
-    - Data Byte 2: 0vvvvvvv (where vvvvvvv is the release velocity, 0-127)
-
-    Example Note-On Message (Channel 1, Note C4, Velocity 64):
-    - Status Byte: 10010000 (0x90)
-    - Data Byte 1: 00111100 (0x3C, Note C4)
-    - Data Byte 2: 01000000 (0x40, Velocity 64)
-
-    Example Note-Off Message (Channel 1, Note C4, Velocity 64):
-    - Status Byte: 10000000 (0x80)
-    - Data Byte 1: 00111100 (0x3C, Note C4)
-    - Data Byte 2: 01000000 (0x40, Velocity 64)
-
-    Note:
-    - The most significant bit (MSB) of each byte is used to distinguish status bytes (MSB = 1) from data bytes (MSB = 0).
-    - The channel number is encoded in the lower nibble of the status byte.
-    """
-    # Initialize an empty deque to store the message
-    message_components = deque()
-
-    # The note-on status byte is 0x90
-    # The first nibble of the chunk is the channel number
-    message_components.append(b'\x90')
-    message_components.append(chunk_group.popleft().to_bytes())
-
-    # The next two bytes (four nibbles) are the note and velocity
-    for _ in range(4):
-        message_components.append(chunk_group.popleft().to_bytes())
-
-    # Convert deque to bytes for mido.Message
-    message_bytes = []
-    while len(message_components) > 1:
-        # We OR every two nibbles to get the full bytes
-        # The [0] is to get the first (and only) byte from the bytearray.
-        # Python does not like to OR bytes directly.
-        message_bytes.append(
-            (message_components.popleft()[0] | message_components.popleft()[0]).to_bytes()
-        )
-    message_bytes = b''.join(message_bytes)
-
-    note_on_message = mido.Message.from_bytes(message_bytes)
-
-    # The remaining 2 nibbles are the timing information
-    # Set note-on time
-    timing = create_timing(chunk_group)
-    note_on_message.time = timing[0]
-
-    # Create note-off message and set time
-    note_off_message = mido.Message('note_off', channel=note_on_message.channel, note=note_on_message.note, velocity=0)
-    note_off_message.time = timing[1]
-
-    return note_on_message, note_off_message
-
-def create_timing(nibbles: deque, ppqn: int=PPQN) -> float:
-    """
-    Creates timing information from nibbles.
-
-    Args:
-        nibbles (deque): A deque of nibbles representing timing information.
-        ppqn (int, optional): Pulses per quarter note. Defaults to PPQN.
-
-    Returns:
-        float: Real time in milliseconds.
-    """
-    # Use the first byte of each chunk for timing
-    note_on_time = join_nibbles_to_int(nibbles)
-    note_length = nibbles.popleft().to_bytes()[0]
-
-    # Convert delta time to real time (in milliseconds) based on a tempo
-    ms_per_tick = (60000 / TEMPO) / ppqn
-    note_on_time = note_on_time * ms_per_tick
-
-    # Map note_length to musical note durations in terms of quarter notes
-    note_durations = {
-        0: 1,      # quarter note
-        1: 0.75,   # dotted eighth note
-        2: 0.5,    # eighth note
-        3: 0.375,  # dotted sixteenth note
-        4: 0.25,   # sixteenth note
-        5: 0.1875, # triplet sixteenth note
-        6: 0.125,  # thirty-second note
-        7: 0.09375,# triplet thirty-second note
-        8: 0.0625, # sixty-fourth note
-        9: 0.046875,# triplet sixty-fourth note
-        10: 0.03125,# one hundred twenty-eighth note
-        11: 0.0234375,# triplet one hundred twenty-eighth note
-        12: 0.015625,# two hundred fifty-sixth note
-        13: 0.01171875,# triplet two hundred fifty-sixth note
-        14: 0.0078125,# five hundred twelfth note
-        15: 0.005859375,# triplet five hundred twelfth note
-    }
-
-    # Get the duration as a proportion of a quarter note
-    note_duration_quarter_notes = note_durations[note_length]
-
-    # Calculate the duration in milliseconds based on the tempo (bpm)
-    ms_per_quarter_note = 60000 / TEMPO
-    note_duration_ms = note_duration_quarter_notes * ms_per_quarter_note
-
-    # Calculate the note-off time
-    note_off_time = note_on_time + note_duration_ms
-
-    return int(note_on_time), int(note_off_time)    
-
 def print_human_readable_midi(midi_message: mido.Message) -> None:
     """
     Prints a human-readable representation of a MIDI message.
@@ -283,6 +185,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_chunks", type=int, default=100, help="Number of chunks to process. Use -1 for all chunks")
     parser.add_argument("--output_file", help="Output MIDI file path (required if output mode is 'file')", default="out.mid")
     parser.add_argument("--chunk_size", type=int, default=4, help="Size of each chunk in bytes")
+    parser.add_argument("--pattern", help="Pattern string for nibble assignment", default="cnvtl")
 
     args = parser.parse_args()
 
